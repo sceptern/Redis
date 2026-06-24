@@ -18,7 +18,10 @@
 // proj
 #include "hashtable.h"
 
-
+/*
+    - container_of macro to get back the whole struct from a member
+    -  we need this due to the use of intrusive data structures
+*/
 #define container_of(ptr, T, member) \
     ((T *)( (char *)ptr - offsetof(T, member) ))
 
@@ -36,7 +39,10 @@ static void die(const char *msg) {
     fprintf(stderr, "[%d] %s\n", errno, msg);
     abort();
 }
-
+/*
+    - setting the fd to nonblocking mode
+    - first we get the current flags add O_NONBLOCK and then set it back
+*/
 static void fd_set_nb(int fd) {
     errno = 0;
     int flags = fcntl(fd, F_GETFL, 0);
@@ -53,9 +59,10 @@ static void fd_set_nb(int fd) {
         die("fcntl error");
     }
 }
-
+// max message size we support
  const size_t k_max_msg = 32 << 20;
  
+ // Buffer using std::vector using uint8 because we process one byte at a time
  typedef std::vector<uint8_t> Buffer;
 
  // append to the back
@@ -99,14 +106,17 @@ static void fd_set_nb(int fd) {
     fd_set_nb(connfd);
 
     // create a new struct Conn
+    // after accepting a new connection we set want_read to true
     Conn* conn = new Conn();
     conn->fd = connfd;
     conn->want_read = true;
     return conn;
  }
 
+ // max value of nstr we support
  const size_t k_max_args = 200 * 1000;
 
+// reads any 4 byte unsigned integer from the buffer, advances the cursor
  static bool read_u32(const uint8_t*& cur, const uint8_t* end, uint32_t &out) {
     if (cur + 4 > end) {
         return false;
@@ -116,6 +126,7 @@ static void fd_set_nb(int fd) {
     return true;
  }
 
+// reads n bytes from the buffer as a string, advances the cursor
  static bool
  read_str(const uint8_t*& cur, const uint8_t* end, size_t n, std::string &out) {
     if (cur + n > end) {
@@ -130,6 +141,25 @@ static void fd_set_nb(int fd) {
 // | nstr | len | str1 | len | str2 | ... | len | strn |
 // +------+-----+------+-----+------+-----+-----+------+
 
+// Outer transport layer:
+// +-----+------------------+
+// | len |    msg body      |
+// +-----+------------------+
+//   4B       len bytes
+//
+// Inner message body (parsed by parse_req):
+// +------+-----+------+-----+------+-----+-----+------+
+// | nstr | len | str1 | len | str2 | ... | len | strn |
+// +------+-----+------+-----+------+-----+-----+------+
+//   4B    4B    ...    4B    ...          4B    ...
+//
+// example: "set foo bar"
+// +---+---+-----+---+-----+---+-----+
+// | 3 | 3 | set | 3 | foo | 3 | bar |
+// +---+---+-----+---+-----+---+-----+
+// nstr=3, then each string preceded by its length
+
+// parsing request after reading nstr, len, str1
 static int32_t
 parse_req(const uint8_t* data, size_t size, std::vector<std::string> &out) {
     const uint8_t* end =  data + size;
@@ -245,7 +275,11 @@ static uint64_t str_hash(const uint8_t *data, size_t len) {
     }
     return h;
 }
-
+/*
+    - swap is used here because it is more efficient (less memory usage)
+    - we do a look up passing in the function pointer for testing equality
+    - if not found then we put out_nil in the output buffer
+*/
 static void do_get(std::vector<std::string> &cmd, Buffer &out) {
     // a dummy Entry just for the lookup
     Entry key;
@@ -302,6 +336,9 @@ static bool cb_keys(HNode* node, void *arg) {
     return true;
 }
 
+/*
+    essentially outputting all keys 
+*/
 static void do_keys(std::vector<std::string> &, Buffer &out) {
     out_arr(out, (uint32_t)hm_size(&g_data.db));
     hm_foreach(&g_data.db, &cb_keys, (void *)&out);
@@ -321,10 +358,12 @@ static void do_request(std::vector<std::string> &cmd, Buffer &out) {
     }
 }
 
+// used to mark beginning of response
 static void response_begin(Buffer &out, size_t* header) {
     *header = out.size();
     buf_append_u32(out, 0);
 }
+// used later on after writing response to check if the msg size is supported or not
 static size_t response_size(Buffer &out, size_t header) {
     return out.size() - header - 4;
 }
@@ -343,6 +382,8 @@ static void response_end(Buffer &out, size_t header) {
 // process 1 request if there is enough data
 static bool try_one_request(Conn* conn) {
     // try to parse the protocl : message header
+    // first 4 bytes are the message length header (total body size)
+    // if we haven't received them yet we can't do anything
     if (conn->incoming.size() < 4) {
         return false; // want read
     }
@@ -462,6 +503,10 @@ int main() {
     }
 
     // a map of all client connections, keyed by fd
+    // fd2conn is a vector indexed directly by fd number
+    // so fd2conn[5] gives the Conn* for file descriptor 5
+    // faster than a hashtable lookup for every event
+
     std::vector<Conn *> fd2conn;
     // the event loop
     std::vector<struct pollfd> poll_args;
