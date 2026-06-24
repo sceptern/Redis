@@ -18,7 +18,6 @@ struct HTab {
 
 // the real hashtable interface
 // it uses 2 hashtables for progressive caching
-
 struct HMap {
     HTab newer;
     HTab older;

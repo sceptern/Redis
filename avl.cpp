@@ -146,28 +146,39 @@ AVLNode* avl_del(AVLNode *node) {
     return root;
 }
 
-// offset into the succeding or preceding node
+// offset into the succeeding or preceding node
 // note: the worst-case is O(log N) regardless of how long the offset is
 AVLNode* avl_offset(AVLNode* node, int64_t offset) {
-    int64_t pos = 0; // the rank difference from the starting node
+    // pos = signed distance from the starting node in sorted order
+    // positive = forward, negative = backward
+    // goal: keep moving until pos == offset
+    int64_t pos = 0;
     while (offset != pos) {
-        if (pos < offset && pos - avl_cnt(node->right) >= offset) {
-            // the target is inside the right subtree
+        if (pos < offset && pos + avl_cnt(node->right) >= offset) {
+            // target is ahead of us AND the right subtree is big enough to contain it
+            // move right (forward in sorted order)
             node = node->right;
+            // skip over the new node's left subtree + the new node itself
             pos += avl_cnt(node->left) + 1;
         } else if (pos > offset && pos - avl_cnt(node->left) <= offset) {
-            // the target is inside the left subtree
+            // target is behind us AND the left subtree is big enough to contain it
+            // move left (backward in sorted order)
             node = node->left;
+            // skip over the new node's right subtree + the new node itself
             pos -= avl_cnt(node->right) + 1;
         } else {
-            // go to the parent 
+            // target is not in either subtree, go up to parent
             AVLNode* parent = node->parent;
             if (!parent) {
-                return NULL;
+                return NULL; // offset is out of bounds
             }
             if (parent->right == node) {
+                // parent is behind us (we are the right child)
+                // moving up means moving backward → pos decreases
                 pos -= avl_cnt(node->left) + 1;
             } else {
+                // parent is ahead of us (we are the left child)
+                // moving up means moving forward → pos increases
                 pos += avl_cnt(node->right) + 1;
             }
             node = parent;
