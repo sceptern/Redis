@@ -64,7 +64,7 @@ static void hm_help_rehasing(HMap *hmap) {
         h_insert(&hmap->newer, h_detach(&hmap->older, from));
         nwork++;
     }
-    // discard the od table if done
+    // discard the old table if done
     if (hmap->older.size == 0 && hmap->older.tab) {
         free(hmap->older.tab);
         hmap->older = HTab{};
