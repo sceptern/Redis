@@ -49,7 +49,7 @@ class RedisClient:
     
         elif tag == 1:  # TAG_ERR
             code = struct.unpack('<I', body[1:5])[0]
-            sg_len = struct.unpack('<I', body[5:9])[0]
+            msg_len = struct.unpack('<I', body[5:9])[0]
             msg = body[9:9 + msg_len].decode()
             raise Exception(f"Redis error {code}: {msg}")
     
@@ -92,14 +92,92 @@ class RedisClient:
         return self._send_request('set', key, value)
     def get(self, key):
         return self._send_request('get', key)
+    def delete(self, key):
+        return self._send_request('del', key)
+
+    def zadd(self, key, score, name):
+        return self._send_request('zadd', key, str(score), name)
+
+    def zscore(self, key, name):
+        return self._send_request('zscore', key, name)
+
+    def zrem(self, key, name):
+        return self._send_request('zrem', key, name)
+
+    def zquery(self, key, score, name, offset, limit):
+        return self._send_request('zquery', key, str(score), name, str(offset), str(limit))
+
+    def pexpire(self, key, ttl_ms):
+        return self._send_request('pexpire', key, str(ttl_ms))
+
+    def pttl(self, key):
+        return self._send_request('pttl', key)
+
+    def keys(self):
+        return self._send_request('keys')
+    def close(self):
+        self.sock.close()
 
 if __name__ == '__main__':
     client = RedisClient('localhost', 1234)
-    
+
+    # basic set/get
+    print("=== SET/GET ===")
     client.set('foo', 'bar')
-    print(client.get('foo'))   # should print 'bar'
-    
+    print(client.get('foo'))           # bar
     client.set('hello', 'world')
-    print(client.get('hello')) # should print 'world'
-    
-    print(client.get('nonexistent'))  # should print None
+    print(client.get('hello'))         # world
+    print(client.get('nonexistent'))   # None
+
+    # delete
+    print("\n=== DEL ===")
+    client.set('todelete', 'value')
+    print(client.delete('todelete'))   # 1
+    print(client.get('todelete'))      # None
+    print(client.delete('todelete'))   # 0 (already gone)
+
+    # keys
+    print("\n=== KEYS ===")
+    print(client.keys())               # ['foo', 'hello']
+
+    # ttl
+    print("\n=== TTL ===")
+    client.set('expiring', 'value')
+    print(client.pttl('expiring'))     # -1 (no ttl)
+    client.pexpire('expiring', 5000)   # expire in 5 seconds
+    print(client.pttl('expiring'))     # ~5000
+    print(client.pttl('nonexistent'))  # -2 (key doesn't exist)
+
+    # sorted set
+    print("\n=== ZSET ===")
+    client.zadd('leaderboard', 100, 'alice')
+    client.zadd('leaderboard', 200, 'bob')
+    client.zadd('leaderboard', 150, 'carol')
+    print(client.zscore('leaderboard', 'alice'))   # 100.0
+    print(client.zscore('leaderboard', 'bob'))     # 200.0
+    print(client.zscore('leaderboard', 'nobody'))  # None
+
+    # zquery - get all pairs sorted by score
+    print("\n=== ZQUERY ===")
+    print(client.zquery('leaderboard', 0, '', 0, 10))
+    # ['alice', 100.0, 'carol', 150.0, 'bob', 200.0]
+
+    # zquery with offset
+    print(client.zquery('leaderboard', 0, '', 2, 4))
+    # ['carol', 150.0, 'bob', 200.0] (skip first 2 values)
+
+    # zrem
+    print("\n=== ZREM ===")
+    print(client.zrem('leaderboard', 'alice'))     # 1
+    print(client.zscore('leaderboard', 'alice'))   # None
+    print(client.zquery('leaderboard', 0, '', 0, 10))
+    # ['carol', 150.0, 'bob', 200.0]
+
+    # wrong type errors
+    print("\n=== TYPE ERRORS ===")
+    try:
+        client.get('leaderboard')  # leaderboard is a zset not string
+    except Exception as e:
+        print(e)  # Redis error 3: not a string value
+
+    client.close()
