@@ -120,7 +120,6 @@ class RedisClient:
 
 if __name__ == '__main__':
     client = RedisClient('localhost', 1234)
-
     # basic set/get
     print("=== SET/GET ===")
     client.set('foo', 'bar')
@@ -179,5 +178,9 @@ if __name__ == '__main__':
         client.get('leaderboard')  # leaderboard is a zset not string
     except Exception as e:
         print(e)  # Redis error 3: not a string value
+
+    
+    print("\n=== KEYS ===")
+    print(client.keys()) 
 
     client.close()
