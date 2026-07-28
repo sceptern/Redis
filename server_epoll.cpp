@@ -18,6 +18,8 @@
 // C++
 #include <string>
 #include <vector>
+#include <unordered_set>
+#include <unordered_map>
 // proj
 #include "common.h"
 #include "hashtable.h"
@@ -80,6 +82,10 @@ struct Conn {
     int fd = -1;
     // protocol
     enum Proto { PROTO_BINARY, PROTO_RESP } proto = PROTO_BINARY;
+
+    bool pubsub_mode = false;
+    std::unordered_set<std::string> subscriptions;
+
     // application's intention, for the event loop
     bool want_read = false;
     bool want_write = false;
@@ -92,6 +98,8 @@ struct Conn {
     uint64_t last_active_ms = 0;
     DList idle_node;
 };
+
+static std::unordered_map<std::string, std::unordered_set<Conn*>>  channels;
 
 static void conn_consume_incoming(Conn* conn, size_t n) {
     conn->incoming_start += n;
@@ -114,7 +122,7 @@ static struct {
     // the thread pool
     ThreadPool thread_pool;
 } g_data;
-
+static int epfd = -1;
 // application callback when the listening socket is ready
 static int32_t handle_accept(int epfd, int fd, Conn::Proto proto) {
     // accept
@@ -140,6 +148,7 @@ static int32_t handle_accept(int epfd, int fd, Conn::Proto proto) {
     conn->proto = proto;
     conn->want_read = true;
     conn->last_active_ms = get_monotonic_msec();
+    dlist_init(&conn->idle_node);
 
     epoll_event ev{};
     ev.events = EPOLLIN;
@@ -168,6 +177,18 @@ static void conn_destroy(int epfd, Conn *conn) {
     (void)close(conn->fd);
     g_data.fd2conn[conn->fd] = NULL;
     dlist_detach(&conn->idle_node);
+
+    for (const auto& channel_name : conn->subscriptions) {
+        auto it = channels.find(channel_name);
+        if (it == channels.end()) {
+            continue;
+        }
+        it->second.erase(conn);
+        if (it->second.empty()) {
+            channels.erase(it);
+        }
+    }
+
     delete conn;
 }
 
@@ -323,6 +344,12 @@ static void out_resp_err(Buffer &out, const std::string &msg) {
 static void out_resp_arr_header(Buffer &out, uint32_t n) {
     std::string r = "*" + std::to_string(n) + "\r\n";
     buf_append(out, (const uint8_t *)r.data(), r.size());
+}
+static void out_resp_str_array(Buffer &out, std::initializer_list<std::string> items) {
+    out_resp_arr_header(out, items.size());
+    for (const auto &s : items) {
+        out_resp_str(out, s);
+    }
 }
 // value types
 enum {
@@ -718,31 +745,124 @@ static void do_zquery(std::vector<std::string> &cmd, Buffer &out, bool resp) {
     }
 }
 
-static void do_request(std::vector<std::string> &cmd, Buffer &out, bool resp = false) {
+static void do_subscribe(Conn* conn, std::vector<std::string> &cmd, Buffer &out, bool resp = false) {
+    if (cmd.size() < 2) {
+        out_resp_err(conn->outgoing, "wrong number of arguments for 'subscribe' command");
+        return;
+    }
+    if (!conn->pubsub_mode) {
+        conn->pubsub_mode = true;
+        dlist_detach(&conn->idle_node);
+        dlist_init(&conn->idle_node);
+    }
+    
+
+    for (size_t i = 1; i < cmd.size(); i++) {
+        const std::string& channel = cmd[i];
+        conn->subscriptions.insert(channel);
+        channels[channel].insert(conn);
+        out_resp_arr_header(conn->outgoing, 3);
+        out_resp_str(conn->outgoing, "subscribe");
+        out_resp_str(conn->outgoing, channel);
+        out_resp_int(conn->outgoing, (int64_t)conn->subscriptions.size());
+    }
+}
+
+static void do_publish(std::vector<std::string> &cmd, Conn* conn, bool resp = false) {
+    if (cmd.size() != 3) {
+        return;
+    }
+    std::string channel_name = cmd[1];
+    auto it = channels.find(channel_name);
+    if (it == channels.end()) {
+        out_resp_int(conn->outgoing, 0);
+        return;
+    }
+
+    std::unordered_set<Conn*>* channel = &channels[channel_name];
+    for (Conn* subscriber : *channel) {
+        out_resp_str_array(subscriber->outgoing, {
+            "message",
+            channel_name,
+            cmd[2]
+        });
+        subscriber->want_read = false;
+        subscriber->want_write = true;
+        conn_update_events(epfd, subscriber);
+    }
+    out_resp_int(conn->outgoing, channel->size());
+}
+
+static void do_request(std::vector<std::string> &cmd, Conn* conn, bool resp = false) {
     if (cmd.size() == 2 && cmd[0] == "get") {
-        return do_get(cmd, out, resp);
+        if (conn->pubsub_mode == true) {
+            return;
+        }
+        return do_get(cmd, conn->outgoing, resp);
     } else if (cmd.size() == 3 && cmd[0] == "set") {
-        return do_set(cmd, out, resp);
+        if (conn->pubsub_mode == true) {
+            return;
+        }
+        return do_set(cmd, conn->outgoing, resp);
     } else if (cmd.size() == 2 && cmd[0] == "del") {
-        return do_del(cmd, out, resp);
+        if (conn->pubsub_mode == true) {
+            return;
+        }
+        return do_del(cmd, conn->outgoing, resp);
     } else if (cmd.size() == 3 && cmd[0] == "pexpire") {
-        return do_expire(cmd, out, resp);
+        if (conn->pubsub_mode == true) {
+            return;
+        }
+        return do_expire(cmd, conn->outgoing, resp);
     } else if (cmd.size() == 2 && cmd[0] == "pttl") {
-        return do_ttl(cmd, out, resp);
+        if (conn->pubsub_mode == true) {
+            return;
+        }
+        return do_ttl(cmd, conn->outgoing, resp);
     } else if (cmd.size() == 1 && cmd[0] == "keys") {
-        return do_keys(cmd, out, resp);
+        if (conn->pubsub_mode == true) {
+            return;
+        }
+        return do_keys(cmd, conn->outgoing, resp);
     } else if (cmd.size() == 4 && cmd[0] == "zadd") {
-        return do_zadd(cmd, out, resp);
+        if (conn->pubsub_mode == true) {
+            return;
+        }
+        return do_zadd(cmd, conn->outgoing, resp);
     } else if (cmd.size() == 3 && cmd[0] == "zrem") {
-        return do_zrem(cmd, out, resp);
+        if (conn->pubsub_mode == true) {
+            return;
+        }
+        return do_zrem(cmd, conn->outgoing, resp);
     } else if (cmd.size() == 3 && cmd[0] == "zscore") {
-        return do_zscore(cmd, out, resp);
+        if (conn->pubsub_mode == true) {
+            return;
+        }
+        return do_zscore(cmd, conn->outgoing, resp);
     } else if (cmd.size() == 6 && cmd[0] == "zquery") {
-        return do_zquery(cmd, out, resp);
-    } else {
+        if (conn->pubsub_mode == true) {
+            return;
+        }
+        return do_zquery(cmd, conn->outgoing, resp);
+    } else if (cmd.size() >= 2 && cmd[0] == "subscribe") {
+        return do_subscribe(conn, cmd, conn->outgoing, resp);
+    } else if (cmd.size() == 3 && cmd[0] == "publish") {
+        return do_publish(cmd, conn, resp);
+    } else if (cmd[0] == "hello") {
+        out_resp_arr_header(conn->outgoing, 14);\
+        out_resp_str(conn->outgoing, "server");   out_resp_str(conn->outgoing, "redis");
+        out_resp_str(conn->outgoing, "version");  out_resp_str(conn->outgoing, "7.0.0");
+        out_resp_str(conn->outgoing, "proto");    out_resp_int(conn->outgoing, 2);
+        out_resp_str(conn->outgoing, "id");       out_resp_int(conn->outgoing, conn->fd);
+        out_resp_str(conn->outgoing, "mode");     out_resp_str(conn->outgoing, "standalone");
+        out_resp_str(conn->outgoing, "role");     out_resp_str(conn->outgoing, "master");
+        out_resp_str(conn->outgoing, "modules");  out_resp_arr_header(conn->outgoing, 0);
+        return;
+    }
+    else {
         return resp
-            ? out_resp_err(out, "unknown command")
-            : out_err(out, ERR_UNKNOWN, "unknown command");
+            ? out_resp_err(conn->outgoing, "unknown command")
+            : out_err(conn->outgoing, ERR_UNKNOWN, "unknown command");
     }
 }
 
@@ -788,6 +908,7 @@ static bool try_one_request_resp(Conn* conn) {
     }
 
     std::vector<std::string> cmd;
+    cmd.reserve(nargs);
     const uint8_t* cur = end + 1;
     for (int i = 0; i < nargs; i++) {
         if (cur >= data + size || *cur != '$') return false;
@@ -811,7 +932,7 @@ static bool try_one_request_resp(Conn* conn) {
     }
     for (auto &c : cmd[0]) c = tolower(c);
 
-    do_request(cmd, conn->outgoing, true);
+    do_request(cmd, conn, true);
     conn_consume_incoming(conn, cur - data);
     return true;
 }
@@ -847,7 +968,7 @@ static bool try_one_request(Conn* conn) {
     }
     size_t header_pos = 0;
     response_begin(conn->outgoing, &header_pos);
-    do_request(cmd, conn->outgoing);
+    do_request(cmd, conn);
     response_end(conn->outgoing, header_pos);
 
     // application logic done! remove the request message.
@@ -1060,7 +1181,7 @@ int main(int argc, char* argv[]) {
     ListenerTag tag_resp   = {fd_resp,   Conn::PROTO_RESP};
 
     // epoll instance
-    int epfd = epoll_create1(0);
+    epfd = epoll_create1(0);
     if (epfd < 0) {
         die("epoll_create1()");
     }
@@ -1105,9 +1226,12 @@ int main(int argc, char* argv[]) {
                 Conn* conn = static_cast<Conn *>(events[i].data.ptr);
                 uint32_t ready = events[i].events;
                 // update the idle timer by moving conn to the end of the list
-                conn->last_active_ms = get_monotonic_msec();
-                dlist_detach(&conn->idle_node);
-                dlist_insert_before(&g_data.idle_list, &conn->idle_node);
+                if (!conn->pubsub_mode) {
+                    conn->last_active_ms = get_monotonic_msec();
+                    dlist_detach(&conn->idle_node);
+                    dlist_insert_before(&g_data.idle_list, &conn->idle_node);
+                }
+                
                 if (ready & EPOLLIN) {
                     handle_read(epfd, conn);
                 }

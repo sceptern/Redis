@@ -2,6 +2,9 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cerrno>
 
 // instrusive data structure
 #define container_of(ptr, type, member) ({                  \
