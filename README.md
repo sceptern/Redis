@@ -1,5 +1,4 @@
 # Redis Server
-
 A Redis-compatible key-value store implemented in C++ from scratch,
 featuring a custom binary protocol, RESP compatibility layer, and both
 poll() and epoll() event loop implementations.
@@ -12,9 +11,11 @@ poll() and epoll() event loop implementations.
 - Idle connection timeouts via doubly linked list
 - Thread pool for async deletion of large data structures
 - Two event loop implementations: poll() and epoll()
+- Pub/Sub messaging with channel fan-out and clean subscriber lifecycle
 - Configurable max-events and idle-timeout for high connection count scenarios
 
 ## Commands
+### Key/Value
 | Command | Description |
 |---------|-------------|
 | GET key | Get string value |
@@ -23,13 +24,23 @@ poll() and epoll() event loop implementations.
 | KEYS | List all keys |
 | PEXPIRE key ms | Set TTL in milliseconds |
 | PTTL key | Get remaining TTL |
+
+### Sorted Sets
+| Command | Description |
+|---------|-------------|
 | ZADD zset score name | Add to sorted set |
 | ZREM zset name | Remove from sorted set |
 | ZSCORE zset name | Get score |
 | ZQUERY zset score name offset limit | Range query |
 
-## Performance
+### Pub/Sub
+| Command | Description |
+|---------|-------------|
+| SUBSCRIBE channel [channel ...] | Subscribe to one or more channels |
+| UNSUBSCRIBE [channel ...] | Unsubscribe from channels, or all if no args |
+| PUBLISH channel message | Push message to all subscribers of a channel |
 
+## Performance
 ### Throughput vs Redis 7.0
 Benchmarked on WSL2 against Redis 7.0.15 (persistence disabled,
 1M requests, 1024 byte payload, 50 concurrent clients):
@@ -89,6 +100,10 @@ redis-cli -p 6379 SET foo bar
 # connect with binary client
 ./client SET foo bar
 
+# pub/sub
+redis-cli -p 6379 SUBSCRIBE news
+redis-cli -p 6379 PUBLISH news "hello"
+
 # benchmark
 redis-benchmark -p 6379 -t set,get -n 100000
 redis-benchmark -p 6379 -t set,get -n 100000 -c 10000
@@ -102,3 +117,6 @@ redis-benchmark -p 6379 -t set,get -n 100000 -c 10000
 - Connection timeouts: doubly linked list ordered by last active time
 - Large deletions: offloaded to thread pool to avoid blocking event loop
 - Dual protocol: binary on port 1234, RESP on port 6379, detected at accept() time
+- Pub/Sub: global channel map (`unordered_map<string, unordered_set<Conn*>>`),
+  subscribers removed from idle timeout list and cleaned up automatically
+  on disconnect via `conn_destroy`
