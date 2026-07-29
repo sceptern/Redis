@@ -793,6 +793,53 @@ static void do_publish(std::vector<std::string> &cmd, Conn* conn, bool resp = fa
     out_resp_int(conn->outgoing, channel->size());
 }
 
+static void do_unsubscribe(Conn* conn, std::vector<std::string>& cmd, bool resp = false) {
+    if (cmd.size() == 1) {
+        while (!conn->subscriptions.empty()) {
+            auto it = conn->subscriptions.begin();
+            std::string channel = *it;
+
+            auto ch = channels.find(channel);
+            if (ch != channels.end()) {
+                ch->second.erase(conn);
+                if (ch->second.empty()) {
+                    channels.erase(ch);
+                }
+            }
+            
+            conn->subscriptions.erase(it);
+            out_resp_arr_header(conn->outgoing, 3);
+            out_resp_str(conn->outgoing, "unsubscribe");
+            out_resp_str(conn->outgoing, channel);
+            out_resp_int(conn->outgoing, (int64_t)conn->subscriptions.size());
+        }
+    } else {
+        for (size_t i = 1; i < cmd.size(); i++) {
+            auto it = conn->subscriptions.find(cmd[i]);
+            if (it != conn->subscriptions.end()) {
+                std::string channel = *it;
+                auto ch = channels.find(channel);
+
+                if (ch != channels.end()) {
+                    ch->second.erase(conn);
+                    if (ch->second.empty()) {
+                    channels.erase(ch);
+                    }
+                }
+                conn->subscriptions.erase(it);
+            }
+            out_resp_arr_header(conn->outgoing, 3);
+            out_resp_str(conn->outgoing, "unsubscribe");
+            out_resp_str(conn->outgoing, cmd[i]);
+            out_resp_int(conn->outgoing, (int64_t)conn->subscriptions.size());
+        }
+    }
+    if (conn->subscriptions.empty()) {
+        conn->pubsub_mode = false;
+        dlist_insert_before(&g_data.idle_list, &conn->idle_node);
+    }
+}
+
 static void do_request(std::vector<std::string> &cmd, Conn* conn, bool resp = false) {
     if (cmd.size() == 2 && cmd[0] == "get") {
         if (conn->pubsub_mode == true) {
@@ -858,6 +905,8 @@ static void do_request(std::vector<std::string> &cmd, Conn* conn, bool resp = fa
         out_resp_str(conn->outgoing, "role");     out_resp_str(conn->outgoing, "master");
         out_resp_str(conn->outgoing, "modules");  out_resp_arr_header(conn->outgoing, 0);
         return;
+    } else if (cmd.size() >=1 && cmd[0] == "unsubscribe") {
+        return do_unsubscribe(conn, cmd, resp);
     }
     else {
         return resp

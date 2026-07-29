@@ -174,4 +174,114 @@ assert count == 0, f"Expected 0 after all disconnects, got {count}"
 print("  PASS")
 
 
+# TEST 8: unsubscribe from a specific channel
+print("TEST 8: unsubscribe from specific channel...")
+sub = make_client()
+p = sub.pubsub()
+p.subscribe('unsub_test')
+p.get_message(timeout=1)  # consume subscribe confirmation
+
+p.unsubscribe('unsub_test')
+msg = p.get_message(timeout=1)
+assert msg is not None, "No unsubscribe confirmation received"
+assert msg['type'] == 'unsubscribe'
+assert msg['channel'] == b'unsub_test'
+assert msg['data'] == 0  # 0 subscriptions remaining
+
+# publish should now reach nobody
+r = make_client()
+count = r.publish('unsub_test', 'should_not_arrive')
+assert count == 0, f"Expected 0 after unsubscribe, got {count}"
+p.close()
+sub.close()
+print("  PASS")
+
+
+# TEST 9: unsubscribe from one channel, still receive on another
+print("TEST 9: partial unsubscribe...")
+still_received = []
+
+def partial_unsub():
+    sub = make_client()
+    p = sub.pubsub()
+    p.subscribe('keep', 'drop')
+    p.get_message(timeout=1)  # confirmation for 'keep'
+    p.get_message(timeout=1)  # confirmation for 'drop'
+
+    p.unsubscribe('drop')
+    msg = p.get_message(timeout=1)
+    assert msg is not None and msg['type'] == 'unsubscribe'
+    assert msg['channel'] == b'drop'
+    assert msg['data'] == 1  # still subscribed to 'keep'
+
+    # should still receive on 'keep'
+    msg = p.get_message(timeout=2)
+    assert msg is not None, "Should still receive on 'keep'"
+    assert msg['type'] == 'message'
+    assert msg['channel'] == b'keep'
+    assert msg['data'] == b'hello'
+    still_received.append(msg)
+    p.close()
+
+t = threading.Thread(target=partial_unsub)
+t.start()
+time.sleep(0.3)
+r = make_client()
+r.publish('drop', 'should_not_arrive')
+r.publish('keep', 'hello')
+t.join(timeout=4)
+assert len(still_received) == 1, "Should have received exactly 1 message on 'keep'"
+time.sleep(0.1)
+count = r.publish('drop', 'again')
+assert count == 0, f"'drop' should have no subscribers, got {count}"
+print("  PASS")
+
+
+# TEST 10: unsubscribe from all channels at once (no args)
+print("TEST 10: unsubscribe from all channels...")
+sub = make_client()
+p = sub.pubsub()
+p.subscribe('all1', 'all2', 'all3')
+for _ in range(3):
+    p.get_message(timeout=1)  # consume subscribe confirmations
+
+p.unsubscribe()  # no args = unsubscribe all
+confirmations = []
+for _ in range(3):
+    msg = p.get_message(timeout=1)
+    assert msg is not None, "Missing unsubscribe confirmation"
+    assert msg['type'] == 'unsubscribe'
+    confirmations.append(msg['channel'])
+
+assert set(confirmations) == {b'all1', b'all2', b'all3'}, \
+    f"Wrong channels in confirmations: {confirmations}"
+
+r = make_client()
+for ch in ['all1', 'all2', 'all3']:
+    count = r.publish(ch, 'test')
+    assert count == 0, f"Expected 0 subscribers on {ch}, got {count}"
+
+p.close()
+sub.close()
+print("  PASS")
+
+
+# TEST 11: normal commands work after full unsubscribe
+print("TEST 11: normal commands work after full unsubscribe...")
+sub = make_client()
+p = sub.pubsub()
+p.subscribe('restore_test')
+p.get_message(timeout=1)
+p.unsubscribe('restore_test')
+p.get_message(timeout=1)  # consume unsubscribe confirmation
+p.close()
+
+sub.set('foo', 'bar')
+val = sub.get('foo')
+assert val == b'bar', f"Expected b'bar', got {val}"
+sub.delete('foo')
+sub.close()
+print("  PASS")
+
+
 print("\nAll tests passed.")
