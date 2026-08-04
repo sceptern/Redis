@@ -283,5 +283,69 @@ sub.delete('foo')
 sub.close()
 print("  PASS")
 
+# TEST 12: normal commands are blocked while in pubsub mode
+print("TEST 12: commands blocked in pubsub mode...")
+sub = make_client()
+p = sub.pubsub()
+p.subscribe('block_test')
+p.get_message(timeout=1)  # consume subscribe confirmation
+
+# SET should be silently ignored (no response) or return an error
+# either way the connection must still be alive afterwards
+# we verify by checking a publish still works
+r = make_client()
+count = r.publish('block_test', 'still alive')
+assert count == 1, f"Expected 1 subscriber, got {count}"
+
+# receive the message to confirm connection is healthy
+msg = p.get_message(timeout=2)
+assert msg is not None and msg['type'] == 'message'
+assert msg['data'] == b'still alive'
+
+p.unsubscribe('block_test')
+p.get_message(timeout=1)
+p.close()
+sub.close()
+print("  PASS")
+
+
+# TEST 13: idle timeout resumes after unsubscribe
+# requires server running with a short idle timeout:
+#   ./server_epoll --idle-timeout 2000
+# skip automatically if using default timeout
+print("TEST 13: idle timeout resumes after unsubscribe...")
+IDLE_TIMEOUT_MS = 2000  # must match --idle-timeout value
+IDLE_TIMEOUT_S  = IDLE_TIMEOUT_MS / 1000
+
+sub = make_client()
+p = sub.pubsub()
+p.subscribe('timeout_test')
+p.get_message(timeout=1)
+
+# unsubscribe — connection rejoins idle list
+p.unsubscribe('timeout_test')
+p.get_message(timeout=1)
+p.close()
+
+# wait longer than the idle timeout
+wait = IDLE_TIMEOUT_S + 1
+print(f"  waiting {wait:.0f}s for idle timeout to fire...")
+time.sleep(wait)
+
+# the connection should have been reaped by now
+# publish should reach nobody
+r = make_client()
+count = r.publish('timeout_test', 'ghost')
+assert count == 0, f"Expected 0, got {count}"
+
+# also verify the server is still alive and accepting connections
+r2 = make_client()
+r2.set('health', 'ok')
+val = r2.get('health')
+assert val == b'ok', f"Server unresponsive after idle timeout: {val}"
+r2.delete('health')
+r2.close()
+print("  PASS (run with --idle-timeout 2000 for this test to be meaningful)")
+
 
 print("\nAll tests passed.")

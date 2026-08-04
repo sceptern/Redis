@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <signal.h>
 #include <errno.h>
 #include <math.h>   // isnan
 // system
@@ -27,7 +28,8 @@
 #include "list.h"
 #include "heap.h"
 #include "thread_pool.h"
-
+#include "vdb.h"
+#include "python_worker.h"
 
 static void msg(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -113,6 +115,8 @@ static void conn_consume_incoming(Conn* conn, size_t n) {
 // global states
 static struct {
     HMap db;
+    VDB vdb;
+    PyWorker py_worker;
     // a map of all client connections, keyed by fd
     std::vector<Conn *> fd2conn;
     // timers for idle connections
@@ -123,6 +127,13 @@ static struct {
     ThreadPool thread_pool;
 } g_data;
 static int epfd = -1;
+
+static void handle_sigint(int) {
+    pyworker_stop(&g_data.py_worker);
+    exit(0);
+}
+
+
 // application callback when the listening socket is ready
 static int32_t handle_accept(int epfd, int fd, Conn::Proto proto) {
     // accept
@@ -840,6 +851,118 @@ static void do_unsubscribe(Conn* conn, std::vector<std::string>& cmd, bool resp 
     }
 }
 
+static void do_vset(std::vector<std::string> &cmd, Buffer &out, bool resp) {
+    if (cmd.size() != 2) {
+        return resp
+            ? out_resp_err(out, "usage: VSET <text>")
+            : out_err(out, ERR_BAD_ARG, "usage: VSET <text>");
+    }
+
+    // check worker is alive
+    if (!g_data.py_worker.to_python || !g_data.py_worker.from_python) {
+        return resp
+            ? out_resp_err(out, "embedding service unavailable")
+            : out_err(out, ERR_UNKNOWN, "embedding service unavailable");
+    }
+
+    // get embedding from python worker
+    std::string json;
+    try {
+        json = pyworker_embed(&g_data.py_worker, cmd[1]);
+    } catch (const std::exception &e) {
+        return resp
+            ? out_resp_err(out, e.what())
+            : out_err(out, ERR_UNKNOWN, e.what());
+    }
+
+    // parse the embedding
+    std::vector<float> embedding;
+    if (!parse_embedding(json, embedding)) {
+        return resp
+            ? out_resp_err(out, "failed to parse embedding")
+            : out_err(out, ERR_UNKNOWN, "failed to parse embedding");
+    }
+
+    vdb_set(&g_data.vdb, cmd[1], embedding);
+    return resp ? out_resp_str(out, "OK") : out_nil(out);
+}
+
+static void do_vdel(std::vector<std::string> &cmd, Buffer &out, bool resp) {
+    if (cmd.size() != 2) {
+        return resp
+            ? out_resp_err(out, "usage: VDEL <text>")
+            : out_err(out, ERR_BAD_ARG, "usage: VDEL <text>");
+    }
+
+    bool deleted = vdb_del(&g_data.vdb, cmd[1]);
+    return resp
+        ? out_resp_int(out, deleted ? 1 : 0)
+        : out_int(out, deleted ? 1 : 0);
+}
+
+static void do_vsearch(std::vector<std::string> &cmd, Buffer &out, bool resp) {
+    if (cmd.size() < 2 || cmd.size() > 3) {
+        return resp
+            ? out_resp_err(out, "usage: VSEARCH <text> [k]")
+            : out_err(out, ERR_BAD_ARG, "usage: VSEARCH <text> [k]");
+    }
+
+    // parse optional k argument, default 1
+    size_t k = 1;
+    if (cmd.size() == 3) {
+        int64_t kval = 0;
+        if (!str2int(cmd[2], kval) || kval <= 0) {
+            return resp
+                ? out_resp_err(out, "k must be a positive integer")
+                : out_err(out, ERR_BAD_ARG, "k must be a positive integer");
+        }
+        k = (size_t)kval;
+    }
+
+    // check worker is alive
+    if (!g_data.py_worker.to_python || !g_data.py_worker.from_python) {
+        return resp
+            ? out_resp_err(out, "embedding service unavailable")
+            : out_err(out, ERR_UNKNOWN, "embedding service unavailable");
+    }
+
+    // embed the query
+    std::string json;
+    try {
+        json = pyworker_embed(&g_data.py_worker, cmd[1]);
+    } catch (const std::exception &e) {
+        return resp
+            ? out_resp_err(out, e.what())
+            : out_err(out, ERR_UNKNOWN, e.what());
+    }
+
+    std::vector<float> query_embedding;
+    if (!parse_embedding(json, query_embedding)) {
+        return resp
+            ? out_resp_err(out, "failed to parse embedding")
+            : out_err(out, ERR_UNKNOWN, "failed to parse embedding");
+    }
+
+    // search
+    std::vector<VSearchResult> results = vdb_search(&g_data.vdb, query_embedding, k);
+
+    // return as flat [text, score, text, score, ...] array
+    if (resp) {
+        out_resp_arr_header(out, (uint32_t)(results.size() * 2));
+        for (const auto &r : results) {
+            out_resp_str(out, r.text);
+            out_resp_dbl(out, r.score);
+        }
+    } else {
+        size_t ctx = out_begin_arr(out);
+        for (const auto &r : results) {
+            out_str(out, r.text.data(), r.text.size());
+            out_dbl(out, (double)r.score);
+        }
+        out_end_arr(out, ctx, (uint32_t)(results.size() * 2));
+    }
+}
+
 static void do_request(std::vector<std::string> &cmd, Conn* conn, bool resp = false) {
     if (cmd.size() == 2 && cmd[0] == "get") {
         if (conn->pubsub_mode == true) {
@@ -907,6 +1030,16 @@ static void do_request(std::vector<std::string> &cmd, Conn* conn, bool resp = fa
         return;
     } else if (cmd.size() >=1 && cmd[0] == "unsubscribe") {
         return do_unsubscribe(conn, cmd, resp);
+    } else if (cmd.size() == 2 && cmd[0] == "vset") {
+        return do_vset(cmd, conn->outgoing, resp);
+    } else if (cmd.size() == 2 && cmd[0] == "vdel") {
+        return do_vdel(cmd, conn->outgoing, resp);
+    } else if ((cmd.size() == 2 || cmd.size() == 3) && cmd[0] == "vsearch") {
+        return do_vsearch(cmd, conn->outgoing, resp);
+    } else if (cmd.size() == 1 && cmd[0] == "ping") {
+        return resp
+            ? out_resp_str(conn->outgoing, "PONG")
+            : out_str(conn->outgoing, "PONG", 4);
     }
     else {
         return resp
@@ -1186,6 +1319,13 @@ int main(int argc, char* argv[]) {
     dlist_init(&g_data.idle_list);
     thread_pool_init(&g_data.thread_pool, 4);
 
+    try {
+        pyworker_start(&g_data.py_worker, "python_worker.py");
+    } catch (const std::exception &e) {
+        fprintf(stderr, "warning: failed to start python worker: %s\n", e.what());
+        fprintf(stderr, "VSET/VSEARCH/VDEL will return errors until worker is available\n");
+    }
+
     // binary protocol socket on port 1234
     int fd_binary = socket(AF_INET, SOCK_STREAM, 0);
     if (fd_binary < 0) {
@@ -1251,7 +1391,8 @@ int main(int argc, char* argv[]) {
         die("epoll_ctl(ADD)");
     }
 
-
+    signal(SIGINT, handle_sigint);
+    signal(SIGTERM, handle_sigint);
     // the event loop
     while (true) {
         // wait for readiness
