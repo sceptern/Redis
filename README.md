@@ -1,3 +1,82 @@
+# Redis Server
+
+A Redis-compatible key-value store implemented in C++ from scratch, featuring a custom binary protocol, RESP compatibility layer, high-performance `poll()` and `epoll()` event loops, Pub/Sub messaging, and a built-in vector database for semantic search using sentence-transformers.
+
+---
+
+# Features
+
+- Custom binary protocol on port **1234** for low-overhead clients
+- RESP protocol on port **6379** for `redis-cli` and `redis-benchmark` compatibility
+- String and Sorted Set (ZSet) data types
+- AVL tree + hash table implementation for O(log n) sorted set operations
+- Key expiration (TTL) using a min-heap scheduler
+- Idle connection timeouts using a doubly linked list
+- Thread pool for asynchronous deletion of large data structures
+- Both **poll()** and **epoll()** event loop implementations
+- Pub/Sub messaging with automatic subscriber cleanup
+- Configurable `--max-events` and `--idle-timeout`
+- Built-in vector database with semantic search
+- Sentence-transformer embeddings served by a persistent Python subprocess
+- AVX2 SIMD-accelerated cosine similarity (8 floats/instruction via `__m256` intrinsics)
+
+---
+
+# Supported Commands
+
+## Key / Value
+
+| Command | Description |
+|---------|-------------|
+| `GET key` | Get string value |
+| `SET key value` | Set string value |
+| `DEL key` | Delete key |
+| `KEYS` | List all keys |
+| `PEXPIRE key ms` | Set TTL in milliseconds |
+| `PTTL key` | Get remaining TTL |
+
+---
+
+## Sorted Sets
+
+| Command | Description |
+|---------|-------------|
+| `ZADD zset score member` | Add/update member |
+| `ZREM zset member` | Remove member |
+| `ZSCORE zset member` | Get member score |
+| `ZQUERY zset score member offset limit` | Range query |
+
+---
+
+## Pub/Sub
+
+| Command | Description |
+|---------|-------------|
+| `SUBSCRIBE channel [channel ...]` | Subscribe to channels |
+| `UNSUBSCRIBE [channel ...]` | Unsubscribe from one or all channels |
+| `PUBLISH channel message` | Broadcast a message |
+
+---
+
+## Vector Database
+
+| Command | Description |
+|---------|-------------|
+| `VSET text` | Embed and store text |
+| `VSEARCH text [k]` | Return top-k semantically similar entries (default k=1) |
+| `VDEL text` | Delete stored vector |
+
+`VSEARCH` returns a flat array of `[text, score, text, score, ...]` ordered by cosine similarity descending.
+
+Example:
+VSET "dogs are loyal companions"
+VSET "puppies love playing fetch"
+VSET "stock prices increased today"
+
+VSEARCH "cute animals" 2
+
+→ ["puppies love playing fetch", 0.72, "dogs are loyal companions", 0.68]
+
 ---
 
 # Performance
