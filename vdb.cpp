@@ -17,16 +17,50 @@ static bool ventry_eq(HNode* node, HNode* key) {
 
 float cosine_sim(const std::vector<float> &a, const std::vector<float> &b) {
     assert(a.size() == b.size());
-    float dot = 0.0f;
-    float na  = 0.0f;
-    float nb  = 0.0f;
-    for (size_t i = 0; i < a.size(); i++) {
-        dot += a[i] * b[i];
-        na  += a[i] * a[i];
-        nb  += b[i] * b[i];
+    
+    const size_t n = a .size();
+    size_t i = 0;
+
+    __m256 dot = _mm256_setzero_ps();
+    __m256 na  = _mm256_setzero_ps();
+    __m256 nb  = _mm256_setzero_ps();
+
+    for (; i + 7 < n; i+=8) {
+        __m256 va = _mm256_loadu_ps(&a[i]);
+        __m256 vb = _mm256_loadu_ps(&b[i]);
+
+        dot = _mm256_add_ps(dot, _mm256_mul_ps(va, vb));
+        na  = _mm256_add_ps(na,  _mm256_mul_ps(va, va));
+        nb  = _mm256_add_ps(nb,  _mm256_mul_ps(vb, vb));
     }
-    if (na == 0.0f || nb == 0.0f) return 0.0f;
-    return dot / (sqrtf(na) * sqrtf(nb));
+
+    alignas(32) float dot_buf[8];
+    alignas(32) float na_buf[8];
+    alignas(32) float nb_buf[8];
+
+    _mm256_store_ps(dot_buf, dot);
+    _mm256_store_ps(na_buf, na);
+    _mm256_store_ps(nb_buf, nb);
+
+    float dot_sum = 0.0f;
+    float na_sum  = 0.0f;
+    float nb_sum  = 0.0f;
+
+    for (int j = 0; j < 8; j++) {
+        dot_sum += dot_buf[j];
+        na_sum  += na_buf[j];
+        nb_sum  += nb_buf[j];
+    }
+
+    for (; i < n; i++) {
+        dot_sum += a[i] * b[i];
+        na_sum  += a[i] * a[i];
+        nb_sum  += b[i] * b[i];
+    }
+
+    if (na_sum == 0.0f || nb_sum == 0.0f) return 0.0f;
+    return dot_sum / (std::sqrt(na_sum) * std::sqrt(nb_sum));
+
 }
 
 bool parse_embedding(const std::string& json, std::vector<float>& out) {

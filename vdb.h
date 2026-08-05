@@ -2,12 +2,16 @@
 
 #include <string>
 #include <vector>
+#include <immintrin.h>
 #include "hashtable.h"
 
 struct VEntry {
     HNode node;
     std::string key;
     std::vector<float> embedding;
+    VEntry() {
+        embedding.reserve(384);
+    }
 };
 
 struct VDB {
