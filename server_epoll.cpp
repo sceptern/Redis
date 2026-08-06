@@ -30,6 +30,7 @@
 #include "thread_pool.h"
 #include "vdb.h"
 #include "python_worker.h"
+#include "persist.h"
 
 static void msg(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -963,89 +964,131 @@ static void do_vsearch(std::vector<std::string> &cmd, Buffer &out, bool resp) {
     }
 }
 
-static void do_request(std::vector<std::string> &cmd, Conn* conn, bool resp = false) {
-    if (cmd.size() == 2 && cmd[0] == "get") {
-        if (conn->pubsub_mode == true) {
-            return;
-        }
+
+enum class Cmd {
+    UNKNOWN,
+    GET, SET, DEL,
+    PEXPIRE, PTTL, KEYS,
+    ZADD, ZREM, ZSCORE, ZQUERY,
+    SUBSCRIBE, UNSUBSCRIBE, PUBLISH,
+    VSET, VDEL, VSEARCH,
+    PING, HELLO,
+};
+
+static const std::unordered_map<std::string, Cmd> k_cmd_map = {
+    {"get",         Cmd::GET},
+    {"set",         Cmd::SET},
+    {"del",         Cmd::DEL},
+    {"pexpire",     Cmd::PEXPIRE},
+    {"pttl",        Cmd::PTTL},
+    {"keys",        Cmd::KEYS},
+    {"zadd",        Cmd::ZADD},
+    {"zrem",        Cmd::ZREM},
+    {"zscore",      Cmd::ZSCORE},
+    {"zquery",      Cmd::ZQUERY},
+    {"subscribe",   Cmd::SUBSCRIBE},
+    {"unsubscribe", Cmd::UNSUBSCRIBE},
+    {"publish",     Cmd::PUBLISH},
+    {"vset",        Cmd::VSET},
+    {"vdel",        Cmd::VDEL},
+    {"vsearch",     Cmd::VSEARCH},
+    {"ping",        Cmd::PING},
+    {"hello",       Cmd::HELLO},
+};
+
+static void do_request(std::vector<std::string> &cmd, Conn *conn, bool resp = false) {
+    if (cmd.empty()) {
+        return resp
+            ? out_resp_err(conn->outgoing, "empty command")
+            : out_err(conn->outgoing, ERR_BAD_ARG, "empty command");
+    }
+
+    auto it = k_cmd_map.find(cmd[0]);
+    Cmd c = (it != k_cmd_map.end()) ? it->second : Cmd::UNKNOWN;
+
+    switch (c) {
+    case Cmd::GET:
+        if (cmd.size() != 2) break;
+        if (conn->pubsub_mode) return;
         return do_get(cmd, conn->outgoing, resp);
-    } else if (cmd.size() == 3 && cmd[0] == "set") {
-        if (conn->pubsub_mode == true) {
-            return;
-        }
+    case Cmd::SET:
+        if (cmd.size() != 3) break;
+        if (conn->pubsub_mode) return;
         return do_set(cmd, conn->outgoing, resp);
-    } else if (cmd.size() == 2 && cmd[0] == "del") {
-        if (conn->pubsub_mode == true) {
-            return;
-        }
+    case Cmd::DEL:
+        if (cmd.size() != 2) break;
+        if (conn->pubsub_mode) return;
         return do_del(cmd, conn->outgoing, resp);
-    } else if (cmd.size() == 3 && cmd[0] == "pexpire") {
-        if (conn->pubsub_mode == true) {
-            return;
-        }
+    case Cmd::PEXPIRE:
+        if (cmd.size() != 3) break;
+        if (conn->pubsub_mode) return;
         return do_expire(cmd, conn->outgoing, resp);
-    } else if (cmd.size() == 2 && cmd[0] == "pttl") {
-        if (conn->pubsub_mode == true) {
-            return;
-        }
+    case Cmd::PTTL:
+        if (cmd.size() != 2) break;
+        if (conn->pubsub_mode) return;
         return do_ttl(cmd, conn->outgoing, resp);
-    } else if (cmd.size() == 1 && cmd[0] == "keys") {
-        if (conn->pubsub_mode == true) {
-            return;
-        }
+    case Cmd::KEYS:
+        if (cmd.size() != 1) break;
+        if (conn->pubsub_mode) return;
         return do_keys(cmd, conn->outgoing, resp);
-    } else if (cmd.size() == 4 && cmd[0] == "zadd") {
-        if (conn->pubsub_mode == true) {
-            return;
-        }
+    case Cmd::ZADD:
+        if (cmd.size() != 4) break;
+        if (conn->pubsub_mode) return;
         return do_zadd(cmd, conn->outgoing, resp);
-    } else if (cmd.size() == 3 && cmd[0] == "zrem") {
-        if (conn->pubsub_mode == true) {
-            return;
-        }
+    case Cmd::ZREM:
+        if (cmd.size() != 3) break;
+        if (conn->pubsub_mode) return;
         return do_zrem(cmd, conn->outgoing, resp);
-    } else if (cmd.size() == 3 && cmd[0] == "zscore") {
-        if (conn->pubsub_mode == true) {
-            return;
-        }
+    case Cmd::ZSCORE:
+        if (cmd.size() != 3) break;
+        if (conn->pubsub_mode) return;
         return do_zscore(cmd, conn->outgoing, resp);
-    } else if (cmd.size() == 6 && cmd[0] == "zquery") {
-        if (conn->pubsub_mode == true) {
-            return;
-        }
+    case Cmd::ZQUERY:
+        if (cmd.size() != 6) break;
+        if (conn->pubsub_mode) return;
         return do_zquery(cmd, conn->outgoing, resp);
-    } else if (cmd.size() >= 2 && cmd[0] == "subscribe") {
+    case Cmd::SUBSCRIBE:
+        if (cmd.size() < 2) break;
         return do_subscribe(conn, cmd, conn->outgoing, resp);
-    } else if (cmd.size() == 3 && cmd[0] == "publish") {
-        return do_publish(cmd, conn, resp);
-    } else if (cmd[0] == "hello") {
-        out_resp_arr_header(conn->outgoing, 14);\
-        out_resp_str(conn->outgoing, "server");   out_resp_str(conn->outgoing, "redis");
-        out_resp_str(conn->outgoing, "version");  out_resp_str(conn->outgoing, "7.0.0");
-        out_resp_str(conn->outgoing, "proto");    out_resp_int(conn->outgoing, 2);
-        out_resp_str(conn->outgoing, "id");       out_resp_int(conn->outgoing, conn->fd);
-        out_resp_str(conn->outgoing, "mode");     out_resp_str(conn->outgoing, "standalone");
-        out_resp_str(conn->outgoing, "role");     out_resp_str(conn->outgoing, "master");
-        out_resp_str(conn->outgoing, "modules");  out_resp_arr_header(conn->outgoing, 0);
-        return;
-    } else if (cmd.size() >=1 && cmd[0] == "unsubscribe") {
+    case Cmd::UNSUBSCRIBE:
+        if (cmd.size() < 1) break;
         return do_unsubscribe(conn, cmd, resp);
-    } else if (cmd.size() == 2 && cmd[0] == "vset") {
+    case Cmd::PUBLISH:
+        if (cmd.size() != 3) break;
+        return do_publish(cmd, conn, resp);
+    case Cmd::VSET:
+        if (cmd.size() != 2) break;
+        if (conn->pubsub_mode) return;
         return do_vset(cmd, conn->outgoing, resp);
-    } else if (cmd.size() == 2 && cmd[0] == "vdel") {
+    case Cmd::VDEL:
+        if (cmd.size() != 2) break;
+        if (conn->pubsub_mode) return;
         return do_vdel(cmd, conn->outgoing, resp);
-    } else if ((cmd.size() == 2 || cmd.size() == 3) && cmd[0] == "vsearch") {
+    case Cmd::VSEARCH:
+        if (cmd.size() < 2 || cmd.size() > 3) break;
+        if (conn->pubsub_mode) return;
         return do_vsearch(cmd, conn->outgoing, resp);
-    } else if (cmd.size() == 1 && cmd[0] == "ping") {
+    case Cmd::PING:
+        if (cmd.size() != 1) break;
         return resp
             ? out_resp_str(conn->outgoing, "PONG")
             : out_str(conn->outgoing, "PONG", 4);
+    case Cmd::HELLO:
+        out_resp_arr_header(conn->outgoing, 14);
+        out_resp_str(conn->outgoing, "server");  out_resp_str(conn->outgoing, "redis");
+        out_resp_str(conn->outgoing, "version"); out_resp_str(conn->outgoing, "7.0.0");
+        out_resp_str(conn->outgoing, "proto");   out_resp_int(conn->outgoing, 2);
+        out_resp_str(conn->outgoing, "id");      out_resp_int(conn->outgoing, conn->fd);
+        out_resp_str(conn->outgoing, "mode");    out_resp_str(conn->outgoing, "standalone");
+        out_resp_str(conn->outgoing, "role");    out_resp_str(conn->outgoing, "master");
+        out_resp_str(conn->outgoing, "modules"); out_resp_arr_header(conn->outgoing, 0);
+        return;
+    default:
+        break;
     }
-    else {
-        return resp
-            ? out_resp_err(conn->outgoing, "unknown command")
-            : out_err(conn->outgoing, ERR_UNKNOWN, "unknown command");
-    }
+    return resp
+        ? out_resp_err(conn->outgoing, "unknown command")
+        : out_err(conn->outgoing, ERR_UNKNOWN, "unknown command");
 }
 
 static void response_begin(Buffer &out, size_t *header) {
@@ -1303,6 +1346,9 @@ static void process_timers(int epfd, uint64_t idle_timeout_ms) {
     }
 }
 
+static uint64_t last_save_ms = 0;
+const uint64_t save_interval_ms = 10 * 1000; // every 60s
+
 int main(int argc, char* argv[]) {
     int max_events = 1024;
     uint64_t idle_timeout_ms = 5 * 1000;
@@ -1318,6 +1364,9 @@ int main(int argc, char* argv[]) {
     // initialization
     dlist_init(&g_data.idle_list);
     thread_pool_init(&g_data.thread_pool, 4);
+    if (!persist_load(&g_data.db)) {
+        fprintf(stderr, "warning: failed to load dump.rdb\n");
+    }
 
     try {
         pyworker_start(&g_data.py_worker, "python_worker.py");
@@ -1441,6 +1490,12 @@ int main(int argc, char* argv[]) {
         }
         // handle timers
         process_timers(epfd, idle_timeout_ms);
+
+        uint64_t now = get_monotonic_msec();
+        if (now - last_save_ms >= save_interval_ms) {
+            persist_save(&g_data.db);
+            last_save_ms = now;
+        }
     }   // the event loop
     return 0;
 }
