@@ -84,7 +84,10 @@ VSET "stock prices increased today"
 
 VSEARCH "cute animals" 2
 → ["puppies love playing fetch", 0.72, "dogs are loyal companions", 0.68]
-```VADD animal_facts.pdf intro "this document is about domestic animals"
+```
+
+```
+VADD animal_facts.pdf intro "this document is about domestic animals"
 VADD animal_facts.pdf dogs "dogs are loyal companions and easy to train"
 VADD animal_facts.pdf cats "cats are independent and low maintenance"
 
@@ -92,7 +95,9 @@ VSEARCH animal_facts.pdf "loyal pets" 2
 → ["dogs", "dogs are loyal companions and easy to train", 0.81, "intro", "this document is about domestic animals", 0.52]
 
 VDEL animal_facts.pdf
-→ 1 (removes the document and all of its chunks)
+→ 1   (removes the document and all of its chunks)
+```
+
 ---
 
 # Performance
@@ -219,7 +224,7 @@ clang++ -O3 -march=native \
     zset.cpp \
     heap.cpp \
     thread_pool.cpp \
-    persist.cpp \
+    persist.cpp
     -lm -ljemalloc
 ```
 
@@ -236,7 +241,7 @@ clang++ -O3 -mavx2 -mfma \
     thread_pool.cpp \
     python_worker.cpp \
     vdb.cpp \
-    persist.cpp \
+    persist.cpp
     -lm -ljemalloc
 ```
 
