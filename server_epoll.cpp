@@ -859,14 +859,12 @@ static void do_vset(std::vector<std::string> &cmd, Buffer &out, bool resp) {
             : out_err(out, ERR_BAD_ARG, "usage: VSET <text>");
     }
 
-    // check worker is alive
     if (!g_data.py_worker.to_python || !g_data.py_worker.from_python) {
         return resp
             ? out_resp_err(out, "embedding service unavailable")
             : out_err(out, ERR_UNKNOWN, "embedding service unavailable");
     }
 
-    // get embedding from python worker
     std::string json;
     try {
         json = pyworker_embed(&g_data.py_worker, cmd[1]);
@@ -876,7 +874,6 @@ static void do_vset(std::vector<std::string> &cmd, Buffer &out, bool resp) {
             : out_err(out, ERR_UNKNOWN, e.what());
     }
 
-    // parse the embedding
     std::vector<float> embedding;
     if (!parse_embedding(json, embedding)) {
         return resp
@@ -884,7 +881,51 @@ static void do_vset(std::vector<std::string> &cmd, Buffer &out, bool resp) {
             : out_err(out, ERR_UNKNOWN, "failed to parse embedding");
     }
 
-    vdb_set(&g_data.vdb, cmd[1], embedding);
+    if (!vdb_set(&g_data.vdb, cmd[1], embedding)) {
+        return resp
+            ? out_resp_err(out, "key exists as a document, use a different key")
+            : out_err(out, ERR_BAD_TYP, "key exists as a document, use a different key");
+    }
+
+    return resp ? out_resp_str(out, "OK") : out_nil(out);
+}
+
+static void do_vadd(std::vector<std::string> &cmd, Buffer &out, bool resp) {
+    if (cmd.size() != 4) {
+        return resp
+            ? out_resp_err(out, "usage: VADD <doc_name> <chunk_name> <text>")
+            : out_err(out, ERR_BAD_ARG, "usage: VADD <doc_name> <chunk_name> <text>");
+    }
+
+    if (!g_data.py_worker.to_python || !g_data.py_worker.from_python) {
+        return resp
+            ? out_resp_err(out, "embedding service unavailable")
+            : out_err(out, ERR_UNKNOWN, "embedding service unavailable");
+    }
+
+    std::string json;
+    try {
+        json = pyworker_embed(&g_data.py_worker, cmd[3]);
+    } catch (const std::exception &e) {
+        return resp
+            ? out_resp_err(out, e.what())
+            : out_err(out, ERR_UNKNOWN, e.what());
+    }
+
+    std::vector<float> embedding;
+    if (!parse_embedding(json, embedding)) {
+        return resp
+            ? out_resp_err(out, "failed to parse embedding")
+            : out_err(out, ERR_UNKNOWN, "failed to parse embedding");
+    }
+
+    bool ok = vdb_add_chunk(&g_data.vdb, cmd[1], cmd[2], cmd[3], embedding);
+    if (!ok) {
+        return resp
+            ? out_resp_err(out, "doc_name exists as a non-document key, use a different key")
+            : out_err(out, ERR_BAD_TYP, "doc_name exists as a non-document key, use a different key");
+    }
+
     return resp ? out_resp_str(out, "OK") : out_nil(out);
 }
 
@@ -902,35 +943,34 @@ static void do_vdel(std::vector<std::string> &cmd, Buffer &out, bool resp) {
 }
 
 static void do_vsearch(std::vector<std::string> &cmd, Buffer &out, bool resp) {
-    if (cmd.size() < 2 || cmd.size() > 3) {
+    if (cmd.size() < 3 || cmd.size() > 4) {
         return resp
-            ? out_resp_err(out, "usage: VSEARCH <text> [k]")
-            : out_err(out, ERR_BAD_ARG, "usage: VSEARCH <text> [k]");
+            ? out_resp_err(out, "usage: VSEARCH <text> [k] | VSEARCH <doc_name> <text> [k]")
+            : out_err(out, ERR_BAD_ARG, "usage: VSEARCH <text> [k] | VSEARCH <doc_name> <text> [k]");
     }
 
-    // parse optional k argument, default 1
-    size_t k = 1;
-    if (cmd.size() == 3) {
-        int64_t kval = 0;
-        if (!str2int(cmd[2], kval) || kval <= 0) {
-            return resp
-                ? out_resp_err(out, "k must be a positive integer")
-                : out_err(out, ERR_BAD_ARG, "k must be a positive integer");
-        }
-        k = (size_t)kval;
-    }
-
-    // check worker is alive
     if (!g_data.py_worker.to_python || !g_data.py_worker.from_python) {
         return resp
             ? out_resp_err(out, "embedding service unavailable")
             : out_err(out, ERR_UNKNOWN, "embedding service unavailable");
     }
 
-    // embed the query
+    bool doc_scoped = (cmd.size() == 4);
+    const std::string &doc_name = doc_scoped ? cmd[1] : "";
+    const std::string &query_text = doc_scoped ? cmd[2] : cmd[1];
+    const std::string &k_arg = doc_scoped ? cmd[3] : cmd[2];
+
+    int64_t kval = 0;
+    if (!str2int(k_arg, kval) || kval <= 0) {
+        return resp
+            ? out_resp_err(out, "k must be a positive integer")
+            : out_err(out, ERR_BAD_ARG, "k must be a positive integer");
+    }
+    size_t k = (size_t)kval;
+
     std::string json;
     try {
-        json = pyworker_embed(&g_data.py_worker, cmd[1]);
+        json = pyworker_embed(&g_data.py_worker, query_text);
     } catch (const std::exception &e) {
         return resp
             ? out_resp_err(out, e.what())
@@ -944,23 +984,42 @@ static void do_vsearch(std::vector<std::string> &cmd, Buffer &out, bool resp) {
             : out_err(out, ERR_UNKNOWN, "failed to parse embedding");
     }
 
-    // search
-    std::vector<VSearchResult> results = vdb_search(&g_data.vdb, query_embedding, k);
-
-    // return as flat [text, score, text, score, ...] array
-    if (resp) {
-        out_resp_arr_header(out, (uint32_t)(results.size() * 2));
-        for (const auto &r : results) {
-            out_resp_str(out, r.text);
-            out_resp_dbl(out, r.score);
+    if (doc_scoped) {
+        std::vector<VDocSearchResult> results =
+            vdb_doc_search(&g_data.vdb, doc_name, query_embedding, k);
+        if (resp) {
+            out_resp_arr_header(out, (uint32_t)(results.size() * 3));
+            for (const auto &r : results) {
+                out_resp_str(out, r.chunk_name);
+                out_resp_str(out, r.text);
+                out_resp_dbl(out, r.score);
+            }
+        } else {
+            size_t ctx = out_begin_arr(out);
+            for (const auto &r : results) {
+                out_str(out, r.chunk_name.data(), r.chunk_name.size());
+                out_str(out, r.text.data(), r.text.size());
+                out_dbl(out, (double)r.score);
+            }
+            out_end_arr(out, ctx, (uint32_t)(results.size() * 3));
         }
     } else {
-        size_t ctx = out_begin_arr(out);
-        for (const auto &r : results) {
-            out_str(out, r.text.data(), r.text.size());
-            out_dbl(out, (double)r.score);
+        std::vector<VSearchResult> results =
+            vdb_search(&g_data.vdb, query_embedding, k);
+        if (resp) {
+            out_resp_arr_header(out, (uint32_t)(results.size() * 2));
+            for (const auto &r : results) {
+                out_resp_str(out, r.text);
+                out_resp_dbl(out, r.score);
+            }
+        } else {
+            size_t ctx = out_begin_arr(out);
+            for (const auto &r : results) {
+                out_str(out, r.text.data(), r.text.size());
+                out_dbl(out, (double)r.score);
+            }
+            out_end_arr(out, ctx, (uint32_t)(results.size() * 2));
         }
-        out_end_arr(out, ctx, (uint32_t)(results.size() * 2));
     }
 }
 
@@ -971,7 +1030,7 @@ enum class Cmd {
     PEXPIRE, PTTL, KEYS,
     ZADD, ZREM, ZSCORE, ZQUERY,
     SUBSCRIBE, UNSUBSCRIBE, PUBLISH,
-    VSET, VDEL, VSEARCH,
+    VSET, VADD, VDEL, VSEARCH,
     PING, HELLO,
 };
 
@@ -994,6 +1053,7 @@ static const std::unordered_map<std::string, Cmd> k_cmd_map = {
     {"vsearch",     Cmd::VSEARCH},
     {"ping",        Cmd::PING},
     {"hello",       Cmd::HELLO},
+    {"vadd",        Cmd::VADD},
 };
 
 static void do_request(std::vector<std::string> &cmd, Conn *conn, bool resp = false) {
@@ -1060,12 +1120,16 @@ static void do_request(std::vector<std::string> &cmd, Conn *conn, bool resp = fa
         if (cmd.size() != 2) break;
         if (conn->pubsub_mode) return;
         return do_vset(cmd, conn->outgoing, resp);
+    case Cmd::VADD:
+        if (cmd.size() != 4) break;
+        if (conn->pubsub_mode) return;
+        return do_vadd(cmd, conn->outgoing, resp);
     case Cmd::VDEL:
         if (cmd.size() != 2) break;
         if (conn->pubsub_mode) return;
         return do_vdel(cmd, conn->outgoing, resp);
     case Cmd::VSEARCH:
-        if (cmd.size() < 2 || cmd.size() > 3) break;
+        if (cmd.size() < 3 || cmd.size() > 4) break;
         if (conn->pubsub_mode) return;
         return do_vsearch(cmd, conn->outgoing, resp);
     case Cmd::PING:
@@ -1364,7 +1428,7 @@ int main(int argc, char* argv[]) {
     // initialization
     dlist_init(&g_data.idle_list);
     thread_pool_init(&g_data.thread_pool, 4);
-    if (!persist_load(&g_data.db)) {
+    if (!persist_load(&g_data.db, g_data.heap)) {
         fprintf(stderr, "warning: failed to load dump.rdb\n");
     }
 
@@ -1493,7 +1557,7 @@ int main(int argc, char* argv[]) {
 
         uint64_t now = get_monotonic_msec();
         if (now - last_save_ms >= save_interval_ms) {
-            persist_save(&g_data.db);
+            persist_save(&g_data.db, g_data.heap);
             last_save_ms = now;
         }
     }   // the event loop
