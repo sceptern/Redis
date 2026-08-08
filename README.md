@@ -17,6 +17,7 @@ A Redis-compatible key-value store implemented in C++ from scratch, featuring a 
 - Pub/Sub messaging with automatic subscriber cleanup
 - Configurable `--max-events` and `--idle-timeout`
 - Built-in vector database with semantic search
+- Document chunking — group named chunks under a document key for scoped, per-document retrieval
 - Sentence-transformer embeddings served by a persistent Python subprocess
 - AVX2 SIMD-accelerated cosine similarity (8 floats/instruction via `__m256` intrinsics)
 
@@ -62,21 +63,36 @@ A Redis-compatible key-value store implemented in C++ from scratch, featuring a 
 
 | Command | Description |
 |---------|-------------|
-| `VSET text` | Embed and store text |
-| `VSEARCH text [k]` | Return top-k semantically similar entries (default k=1) |
-| `VDEL text` | Delete stored vector |
+| `VSET text` | Embed and store a standalone piece of text |
+| `VADD doc_name chunk_name text` | Embed and store a named chunk under a document. Creates the document on first use; if `chunk_name` already exists under `doc_name`, its text and embedding are overwritten in place (upsert) |
+| `VSEARCH text [k]` | Search only standalone `VSET` entries. Returns top-k by cosine similarity (default k=1) |
+| `VSEARCH doc_name text [k]` | Search only the chunks belonging to `doc_name`. Returns top-k chunks from that document |
+| `VDEL key` | Delete a `VSET` entry, or an entire document (`VADD`) along with all of its chunks |
 
-`VSEARCH` returns a flat array of `[text, score, text, score, ...]` ordered by cosine similarity descending.
+A key created with `VSET` and a document created with `VADD` occupy the same namespace but are distinct types — attempting to `VSET` a key that already exists as a document (or vice versa) returns an error rather than silently overwriting it.
 
-Example:
+`VSEARCH text [k]` (2–3 args) returns a flat array of `[text, score, text, score, ...]`, searching only standalone `VSET` entries — it never returns document chunks.
+
+`VSEARCH doc_name text [k]` (3–4 args) returns a flat array of `[chunk_name, text, score, chunk_name, text, score, ...]`, scoped to a single document's chunks.
+
+Examples:
+
+```
 VSET "dogs are loyal companions"
 VSET "puppies love playing fetch"
 VSET "stock prices increased today"
 
 VSEARCH "cute animals" 2
-
 → ["puppies love playing fetch", 0.72, "dogs are loyal companions", 0.68]
+```VADD animal_facts.pdf intro "this document is about domestic animals"
+VADD animal_facts.pdf dogs "dogs are loyal companions and easy to train"
+VADD animal_facts.pdf cats "cats are independent and low maintenance"
 
+VSEARCH animal_facts.pdf "loyal pets" 2
+→ ["dogs", "dogs are loyal companions and easy to train", 0.81, "intro", "this document is about domestic animals", 0.52]
+
+VDEL animal_facts.pdf
+→ 1 (removes the document and all of its chunks)
 ---
 
 # Performance
@@ -149,6 +165,12 @@ embedding round-trip (~8 ms). The C++ HMap insert is sub-millisecond.
 Search scales O(n) with corpus size (brute-force scan). ANN indexing (HNSW)
 is the natural next step to reduce search to O(log n).
 
+> Note: document (`VADD`) deletion is not yet routed through the thread pool
+> the way large ZSet deletion is (see below) — `VDEL` on a document currently
+> frees all of its chunks synchronously on the event loop thread. This is a
+> non-issue at typical chunk counts per document, but is a candidate for the
+> same async-destruction treatment if document sizes grow large.
+
 ---
 
 ## Thread Pool — Event Loop Responsiveness
@@ -197,6 +219,7 @@ clang++ -O3 -march=native \
     zset.cpp \
     heap.cpp \
     thread_pool.cpp \
+    persist.cpp \
     -lm -ljemalloc
 ```
 
@@ -213,6 +236,7 @@ clang++ -O3 -mavx2 -mfma \
     thread_pool.cpp \
     python_worker.cpp \
     vdb.cpp \
+    persist.cpp \
     -lm -ljemalloc
 ```
 
@@ -226,6 +250,12 @@ The vector database requires Python 3 with sentence-transformers:
 python3 -m venv venv
 source venv/bin/activate
 pip install sentence-transformers
+```
+
+Testing the vector database over RESP additionally requires `redis-py`:
+
+```bash
+pip install redis
 ```
 
 jemalloc (optional, recommended):
@@ -273,11 +303,20 @@ redis-cli -p 6379 PUBLISH news "hello"
 ## Vector Database
 
 ```bash
+# standalone facts
 redis-cli -p 6379 VSET "dogs are cute"
 redis-cli -p 6379 VSET "cats are adorable"
 redis-cli -p 6379 VSEARCH "cute pets" 3
 redis-cli -p 6379 VDEL "dogs are cute"
+
+# documents made of named chunks
+redis-cli -p 6379 VADD animal_facts.pdf intro "an overview of domestic animals"
+redis-cli -p 6379 VADD animal_facts.pdf dogs "dogs are loyal companions"
+redis-cli -p 6379 VSEARCH animal_facts.pdf "loyal pets" 2
+redis-cli -p 6379 VDEL animal_facts.pdf
 ```
+
+Note: when using `redis-py` against the RESP port, explicitly pass `protocol=2` when constructing the client (`redis.Redis(..., protocol=2)`). The server always replies to `HELLO` with a flat RESP2 array; a client that negotiates RESP3 will fail to parse it.
 
 ## Benchmarks
 
@@ -295,6 +334,17 @@ python3 benchmarkVDB.py
 python3 benchmarkZSet.py
 ```
 
+## Tests
+
+```bash
+python3 testVDB.py --port 6379
+```
+
+Covers `VSET`/`VADD`/`VDEL`/`VSEARCH` (global and document-scoped), upsert
+behavior on repeated `VADD` calls, type conflicts between `VSET` and `VADD`
+keys, cascading deletion of a document's chunks, `k`-limit enforcement, and
+argument validation.
+
 ---
 
 # Architecture
@@ -311,9 +361,18 @@ python3 benchmarkZSet.py
 
 ## Vector Database
 
-Separate `VDB` struct with its own `HMap` keyed by text. Each `VEntry` stores
-a 384-dimensional float embedding. `VSEARCH` scans all entries via `hm_foreach`
-and ranks by cosine similarity.
+Separate `VDB` struct with its own `HMap` keyed by name. Each `VEntry` has a
+`type` — `V_EMBED` for a standalone `VSET` entry (a single 384-dimensional
+embedding), or `V_DOC` for a document created via `VADD` (an
+`unordered_map<string, VChunk>` of named chunks, each with its own text and
+embedding, keyed by `chunk_name` for O(1) lookup and upsert).
+
+`VSEARCH text [k]` scans only `V_EMBED` entries via `hm_foreach`, ranking by
+cosine similarity. `VSEARCH doc_name text [k]` looks up a single `V_DOC`
+entry by name and ranks only its chunks — it never scans the full table.
+Deleting a document (`VDEL doc_name`) frees the `VEntry` and, via ordinary
+C++ destruction, every chunk it owns in one call — no separate cleanup step
+is required since chunks are stored by value rather than by pointer.
 
 Cosine similarity is computed using AVX2 SIMD intrinsics (`__m256`), processing
 8 floats per instruction. At 10k vectors this reduces search latency from 64ms
